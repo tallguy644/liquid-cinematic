@@ -1,0 +1,23 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Draining Liquid",
+	"Description": "Parametric, Sequencer-friendly draining liquid (absorption, meniscus, vortex, slosh, wet glass) for cinematics.",
+	"Category": "Rendering",
+	"CreatedBy": "",
+	"EnabledByDefault": false,
+	"CanContainContent": true,
+	"Modules": [
+		{
+			"Name": "DrainingLiquidShaders",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit"
+		},
+		{
+			"Name": "DrainingLiquid",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}

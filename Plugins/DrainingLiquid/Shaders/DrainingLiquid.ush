@@ -1,0 +1,271 @@
+// =====================================================================================
+//  DrainingLiquid.ush  -  parametric draining liquid for UE5 Custom material nodes
+//  Custom node "Include File Paths":  /DrainingLiquidShaders/DrainingLiquid.ush
+//
+//  All parameters are written every frame by ADrainingLiquidActor, so the material
+//  only holds the "look" (absorption, scatter colour, foam colour, roughness).
+//  Units are centimetres, world space.
+// =====================================================================================
+#pragma once
+
+static const float  DL_TAU = 6.28318531;
+static const float2 DL_WAVE_DIR[4]  = { float2(1.0, 0.0), float2(0.6, 0.8), float2(-0.71, 0.70), float2(0.28, -0.96) };
+static const float  DL_WAVE_FREQ[4] = { 1.0, 1.73, 2.41, 3.17 };
+
+// Stable tangent frame. The liquid surface always faces roughly up, so the basis never flips.
+void DL_Basis(float3 N, out float3 T, out float3 B)
+{
+    float3 Ref = abs(N.y) < 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
+    T = normalize(cross(Ref, N));
+    B = cross(N, T);
+}
+
+float DL_Hash21(float2 p)
+{
+    p = frac(p * float2(123.34, 456.21));
+    p += dot(p, p + 45.32);
+    return frac(p.x * p.y);
+}
+
+// Fine ripples: 4 directional sines with analytic gradient. Returns (height, dh/dx, dh/dy).
+float3 DL_Ripples(float2 xy, float Time, float Wavelength, float Amplitude, float Speed)
+{
+    float3 Acc = 0;
+    [unroll]
+    for (int i = 0; i < 4; i++)
+    {
+        float k  = DL_TAU * DL_WAVE_FREQ[i] / max(Wavelength, 0.01);
+        float a  = Amplitude / DL_WAVE_FREQ[i];
+        float ph = k * dot(DL_WAVE_DIR[i], xy) - Time * Speed * rsqrt(DL_WAVE_FREQ[i]);
+        float s, c;
+        sincos(ph, s, c);
+        Acc.x  += a * s;
+        Acc.yz += a * c * k * DL_WAVE_DIR[i];
+    }
+    return Acc;
+}
+
+// Drain whirlpool: funnel depression + rotating log-spiral arms around the drain.
+// rel = position relative to the drain (cm). Returns (height, dh/dx, dh/dy).
+//   Vortex = (Strength, CoreRadius, Depth, Arms)   Spiral = (Tightness, Spin, -, -)
+float3 DL_Vortex(float2 rel, float Time, float4 Vortex, float4 Spiral, out float Foam)
+{
+    float Strength = Vortex.x;
+    float rc       = max(Vortex.y, 0.01);
+    float Depth    = Vortex.z;
+    float Arms     = max(round(Vortex.w), 1.0);   // must be whole, or atan2 leaves a seam
+    float Tight    = Spiral.x;
+    float Spin     = Spiral.y;
+
+    float  r    = length(rel);
+    float2 rhat = rel / max(r, 1e-4);
+    float2 that = float2(-rhat.y, rhat.x);
+
+    // Funnel (Rankine-like): h = -D*S / (1 + (r/rc)^2)
+    float q    = 1.0 + (r * r) / (rc * rc);
+    float h    = -Depth * Strength / q;
+    float dhdr = Depth * Strength * 2.0 * r / (rc * rc * q * q);
+
+    // Spiral arms that wind into the drain and rotate over time
+    float theta = atan2(rel.y, rel.x);
+    float env   = Strength * exp(-r / (rc * 4.0)) * smoothstep(0.0, rc * 0.5, r);
+    float ph    = Arms * theta + Tight * log(r + 1.0) - Spin * Time;
+    float s, c;
+    sincos(ph, s, c);
+    float amp = Depth * 0.15;
+    h    += amp * env * s;
+    dhdr += amp * (-env / (rc * 4.0) * s + env * c * Tight / (r + 1.0));
+    float dhdth = amp * env * c * Arms;
+
+    float2 grad = dhdr * rhat + (dhdth / max(r, rc * 0.25)) * that;
+
+    Foam = Strength * exp(-(r * r) / (rc * rc * 0.36));   // aerated core
+    return float3(h, grad);
+}
+
+// Up-facing normal of the rippled, swirling surface at surface point X.
+float3 DL_SurfaceNormal(float3 X, float3 PlaneO, float3 PlaneN, float3 DrainP, float Time,
+                        float4 Waves, float4 Vortex, float4 Spiral, out float Foam)
+{
+    float3 T, B;
+    DL_Basis(PlaneN, T, B);
+    float3 lx  = X - PlaneO;
+    float3 ld  = DrainP - PlaneO;
+    float2 xy  = float2(dot(lx, T), dot(lx, B));
+    float2 dxy = float2(dot(ld, T), dot(ld, B));
+
+    float3 w = DL_Ripples(xy, Time, Waves.x, Waves.y, Waves.z);
+    float3 v = DL_Vortex(xy - dxy, Time, Vortex, Spiral, Foam);
+    float2 g = w.yz + v.yz;
+    return normalize(PlaneN - g.x * T - g.y * B);
+}
+
+// Distance from P along unit dir V until the ray leaves the cylinder (AxisO + t*AxisD, radius R).
+float DL_CylinderExit(float3 P, float3 V, float3 AxisO, float3 AxisD, float R)
+{
+    float3 rp = P - AxisO;
+    rp -= dot(rp, AxisD) * AxisD;
+    float3 d = V - dot(V, AxisD) * AxisD;
+    float a = dot(d, d);
+    if (a < 1e-6) return 1e7;
+    float b = 2.0 * dot(rp, d);
+    float c = dot(rp, rp) - R * R;
+    float disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) return 0.0;
+    return max((-b + sqrt(disc)) / (2.0 * a), 0.0);
+}
+
+// -------------------------------------------------------------------------------------
+//  MAIN: call once per pixel of the liquid mesh (material must be Two Sided).
+//   Front faces = liquid body seen through the glass, clipped above the waterline
+//                 (a thin meniscus band is kept), with underside-of-surface view when
+//                 the camera is below the waterline.
+//   Back faces  = reused as the true top surface when the camera is above it. The exact
+//                 ray/plane hit is reconstructed, so ripples and the vortex don't stretch.
+//  Returns world-space shading normal.
+//   Shape = (Radius at waterline, MeniscusHeight, EdgeFoamWidth, BackfaceNormalSign)
+// -------------------------------------------------------------------------------------
+float3 DL_Liquid(float3 P, float3 Cam, float TwoSidedSign, float3 VertexN, float SceneThickness, float Time,
+                 float3 PlaneO, float3 PlaneN, float3 AxisO, float3 AxisD, float3 DrainP,
+                 float4 Shape, float4 Waves, float4 Vortex, float4 Spiral,
+                 out float Thickness, out float Foam, out float Rim, out float Underside)
+{
+    float Radius    = Shape.x;
+    float MeniscusH = max(Shape.y, 1e-3);
+    float EdgeFoam  = max(Shape.z, 1e-3);
+    float NSign     = Shape.w;
+
+    float  h = dot(P - PlaneO, PlaneN);
+    float3 V = normalize(P - Cam);
+    Foam = 0; Rim = 0; Underside = 0; Thickness = 0;
+
+    if (TwoSidedSign > 0)
+    {
+        // ---------------- BODY ----------------
+        clip(MeniscusH - h);
+        Rim = saturate(h / MeniscusH);
+
+        float tExit = min(DL_CylinderExit(P, V, AxisO, AxisD, Radius), SceneThickness);
+        float vn    = dot(V, PlaneN);
+        float tSurf = (vn > 1e-4 && h < 0.0) ? (-h / vn) : 1e7;
+        Thickness   = max(min(tExit, tSurf), 0.0);
+        if (h > 0.0) Thickness = min(Thickness, MeniscusH);   // meniscus is a thin film
+
+        if (tSurf < tExit)
+        {
+            // Looking up at the surface from below -> silvery total-internal-reflection band
+            float3 X = P + V * tSurf;
+            Underside = 1;
+            return -DL_SurfaceNormal(X, PlaneO, PlaneN, DrainP, Time, Waves, Vortex, Spiral, Foam);
+        }
+        return VertexN;
+    }
+    else
+    {
+        // ---------------- TOP SURFACE (via back faces) ----------------
+        float hc = dot(Cam - PlaneO, PlaneN);
+        clip(hc);     // camera above the surface
+        clip(-h);     // this pixel lies below it -> the view ray crossed the surface
+
+        float3 Ray = P - Cam;
+        float3 X   = Cam + Ray * (hc / max(hc - h, 1e-4));    // exact surface hit
+
+        float3 rx = X - AxisO;
+        rx -= dot(rx, AxisD) * AxisD;
+        float d = length(rx);
+        clip(Radius - d);   // the crossing must be inside the container
+
+        Thickness = length(P - X);
+        float3 N = DL_SurfaceNormal(X, PlaneO, PlaneN, DrainP, Time, Waves, Vortex, Spiral, Foam);
+        Foam = saturate(Foam + 0.5 * smoothstep(Radius - EdgeFoam, Radius, d));   // contact line
+        return N * NSign;
+    }
+}
+
+// -------------------------------------------------------------------------------------
+//  SHADING: Beer-Lambert absorption by real thickness, Fresnel, TIR from below,
+//  foam and meniscus. Returns BaseColor.
+//  Wire:  Emissive = SceneColor(OffsetFraction = RefractOffset).rgb * Transmittance
+//   Optics = (RefractStrength, Roughness, FoamRoughness, Murk 0..1)
+// -------------------------------------------------------------------------------------
+float3 DL_Shade(float3 N, float3 ViewN, float3 P, float3 Cam, float Thickness, float Foam, float Rim, float Underside,
+                float3 Absorption, float3 ScatterColor, float3 FoamColor, float4 Optics,
+                out float3 Transmittance, out float2 RefractOffset, out float Roughness)
+{
+    float RefractStrength = Optics.x;
+    float SmoothRough     = Optics.y;
+    float FoamRough       = Optics.z;
+    float Murk            = saturate(Optics.w);
+
+    float3 V   = normalize(Cam - P);
+    float  NoV = saturate(abs(dot(N, V)));
+    float  F   = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);                    // water F0 ~ 0.02
+    float  TIR = Underside * (1.0 - smoothstep(0.55, 0.70, NoV));       // past ~48.6 deg from below
+
+    float3 T       = exp(-max(Absorption, 0.0) * Thickness);            // Absorption in 1/cm
+    float  Absorb  = dot(1.0 - T, float3(0.3333, 0.3333, 0.3333));
+    float  Cover   = saturate(Foam + 0.6 * Rim);
+
+    float3 Through = T * (1.0 - F) * (1.0 - Murk * Absorb) * (1.0 - Cover);
+    Through        = lerp(Through, T * T * 0.9, TIR);                   // mirror of the liquid itself
+    Transmittance  = Through;
+
+    RefractOffset = ViewN.xy * float2(1.0, -1.0) * RefractStrength * saturate(Thickness / 4.0);
+    Roughness     = lerp(SmoothRough, FoamRough, Cover);
+
+    float3 Scatter = ScatterColor * Murk * (1.0 - T);
+    return Scatter * (1.0 - Cover) + FoamColor * Cover;
+}
+
+// -------------------------------------------------------------------------------------
+//  GLASS: wet film right above the receding waterline, rivulets and beaded droplets
+//  higher up, faint residue ring at the starting level. Inputs come from the
+//  MPC written by the actor (DL_SurfaceH, DL_WetTopH, DL_StartH, DL_Radius, DL_AxisOrigin, DL_AxisDir).
+// -------------------------------------------------------------------------------------
+void DL_GlassWet(float3 P, float3 AxisO, float3 AxisD, float Radius,
+                 float SurfaceH, float WetTopH, float StartH, float Time,
+                 float FilmFade, float DropSize, float RingWidth,
+                 out float Wet, out float Drops, out float Ring)
+{
+    float3 rp     = P - AxisO;
+    float  h      = dot(rp, AxisD);
+    float3 radial = rp - h * AxisD;
+    float3 T, B;
+    DL_Basis(AxisD, T, B);
+    float ang = atan2(dot(radial, B), dot(radial, T));
+
+    float Size = max(DropSize, 0.05);
+    float Cols = max(round(DL_TAU * max(Radius, 1.0) / Size), 3.0);
+    float u    = (ang / DL_TAU + 0.5) * Cols;         // whole number of cells -> no seam
+    float v    = h / Size;
+
+    float above = h - SurfaceH;
+    float band  = step(0.0, above) * (1.0 - smoothstep(WetTopH - Size, WetTopH, h));
+
+    // Fresh film hugging the waterline
+    float Film = exp(-max(above, 0.0) / max(FilmFade, 0.01));
+
+    // Rivulets running down toward the water
+    float colId  = floor(u / 3.0);
+    float colF   = frac(u / 3.0) - 0.5;
+    float rA     = DL_Hash21(float2(colId, 7.13));
+    float rB     = DL_Hash21(float2(colId, 1.91));
+    float width  = lerp(0.03, 0.12, rB);
+    float head   = max(SurfaceH, WetTopH - Time * lerp(0.5, 3.0, rA) - rB * 2.0);
+    float Streak = (1.0 - smoothstep(0.0, width, abs(colF))) * step(0.6, rA) * step(head, h);
+
+    // Beaded droplets
+    float2 cid  = floor(float2(u, v));
+    float2 cf   = frac(float2(u, v)) - 0.5;
+    float  r1   = DL_Hash21(cid);
+    float  r2   = DL_Hash21(cid + 17.3);
+    float  r3   = DL_Hash21(cid + 3.7);
+    float2 ctr  = (float2(r1, r2) - 0.5) * 0.5;
+    float  rad  = lerp(0.12, 0.35, r3);
+    float  Drop = (1.0 - smoothstep(rad * 0.6, rad, length(cf - ctr))) * step(0.4, r1);
+
+    float rw = max(RingWidth, 1e-3);
+    Wet   = band * saturate(Film + Streak * 0.7);
+    Drops = band * Drop * (1.0 - Film);
+    Ring  = (1.0 - smoothstep(0.0, rw, abs(h - StartH))) * step(SurfaceH, StartH - rw);
+}
