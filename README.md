@@ -13,6 +13,6 @@ Unreal Engine 5.8 project for a cinematic of liquid draining out of a glass.
 
 1. Clone, then double-click `LiquidCinematic.uproject` (needs Visual Studio with *Game development with C++*).
 2. Click **Yes** when asked to rebuild modules.
-3. Open `Content/Maps/LiquidShot`, then `LS_Drain` in Sequencer and scrub.
+3. Open `Content/Maps/LiquidShot` and press **Play** — the drain plays automatically and loops. Or open `LS_Drain` in Sequencer and scrub.
 
 Render with Movie Render Queue using Lumen (not the Path Tracer).
